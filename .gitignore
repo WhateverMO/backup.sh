@@ -2,3 +2,4 @@ sync.conf.tmplt
 data/*
 .sync_state/*
 *.log
+sync.conf
