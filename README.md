@@ -72,7 +72,8 @@ source_path:destination_path:frequency
 
 ```bash
 ./daemon.sh           # Foreground
-nohup ./daemon.sh &   # Background
+./daemon.sh &         # Background
+fg                    # back to foreground
 ```
 
 - Runs `sync.sh` every 60 seconds

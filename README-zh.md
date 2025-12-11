@@ -72,7 +72,8 @@
 
 ```bash
 ./daemon.sh           # 前台运行
-nohup ./daemon.sh &   # 后台运行
+./daemon.sh &         # 后台运行
+fg                    # 回到前台
 ```
 
 - 每60秒运行一次 `sync.sh`
