@@ -8,6 +8,12 @@ STATE_DIR="${SCRIPT_DIR}/.sync_state"
 LOG_FILE="${SCRIPT_DIR}/sync.log"
 DATA_DIR="${SCRIPT_DIR}/data"
 
+# Parse command line arguments
+FORCE_SYNC=0
+if [ "$1" = "--force" ] || [ "$1" = "-f" ]; then
+  FORCE_SYNC=1
+fi
+
 # Ensure required directories exist
 mkdir -p "$STATE_DIR" "$DATA_DIR" 2>/dev/null
 
@@ -135,6 +141,56 @@ symlink_needs_update() {
   return 1
 }
 
+# Check if sync should be performed
+should_sync() {
+  state_file="$1"
+  frequency="$2"
+  now="$3"
+  last_sync="$4"
+
+  # If force mode, always sync
+  if [ "$FORCE_SYNC" -eq 1 ]; then
+    return 0
+  fi
+
+  # Parse frequency
+  unit=$(echo "$frequency" | tr -d '0-9')
+  value=$(echo "$frequency" | tr -d 'a-zA-Z')
+
+  # Default to minutes if no unit specified
+  if [ -z "$unit" ]; then
+    unit="m"
+  fi
+
+  # Default value
+  if [ -z "$value" ]; then
+    value=1
+  fi
+
+  # Set interval in seconds
+  case "$unit" in
+  s) interval="$value" ;;
+  m) interval=$((value * 60)) ;;
+  h) interval=$((value * 3600)) ;;
+  d) interval=$((value * 86400)) ;;
+  w) interval=$((value * 604800)) ;;
+  *) return 0 ;; # Invalid unit, sync anyway
+  esac
+
+  # Check if we should sync
+  if [ -n "$last_sync" ] && [ "$last_sync" -gt 0 ] 2>/dev/null; then
+    time_diff=$((now - last_sync))
+    if [ "$time_diff" -ge "$interval" ]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
+
+  # No previous sync, should sync
+  return 0
+}
+
 # Main synchronization function
 sync_folder() {
   src="$1"
@@ -168,46 +224,36 @@ sync_folder() {
     last_sync=$(cat "$state_file" 2>/dev/null)
   fi
 
-  # Parse frequency
-  unit=$(echo "$frequency" | tr -d '0-9')
-  value=$(echo "$frequency" | tr -d 'a-zA-Z')
-
-  # Default to minutes if no unit specified
-  if [ -z "$unit" ]; then
-    unit="m"
-  fi
-
-  # Default value
-  if [ -z "$value" ]; then
-    value=1
-  fi
-
-  # Set interval in seconds
-  case "$unit" in
-  s) interval="$value" ;;
-  m) interval=$((value * 60)) ;;
-  h) interval=$((value * 3600)) ;;
-  d) interval=$((value * 86400)) ;;
-  w) interval=$((value * 604800)) ;;
-  *)
-    log "ERROR: Invalid frequency unit - $unit"
-    return 1
-    ;;
-  esac
-
   now=$(date +%s)
 
-  # Check if we should skip this sync
-  if [ -n "$last_sync" ] && [ "$last_sync" -gt 0 ] 2>/dev/null; then
-    time_diff=$((now - last_sync))
-    if [ "$time_diff" -lt "$interval" ]; then
-      # Skip silently as requested
-      return 0
+  # Check if we should perform sync
+  if ! should_sync "$state_file" "$frequency" "$now" "$last_sync"; then
+    # Log skipped sync for debugging
+    if [ "$FORCE_SYNC" -eq 0 ]; then
+      time_diff=$((now - last_sync))
+      unit=$(echo "$frequency" | tr -d '0-9')
+      value=$(echo "$frequency" | tr -d 'a-zA-Z')
+      [ -z "$value" ] && value=1
+      [ -z "$unit" ] && unit="m"
+
+      case "$unit" in
+      s) interval="$value" ;;
+      m) interval=$((value * 60)) ;;
+      h) interval=$((value * 3600)) ;;
+      d) interval=$((value * 86400)) ;;
+      w) interval=$((value * 604800)) ;;
+      *) interval=60 ;;
+      esac
+
+      remaining=$((interval - time_diff))
+      if [ "$remaining" -gt 0 ]; then
+        # Silent skip as requested
+        return 0
+      fi
     fi
   fi
 
   # Start synchronization
-  sync_start_time=$(date '+%Y-%m-%d %H:%M:%S')
   log "SYNC: $src -> $dest"
 
   # Initialize counters
@@ -347,6 +393,7 @@ main() {
 
   # Track if any sync was actually performed
   sync_performed=0
+  skipped_count=0
   line_number=0
 
   # Process each line in config file
@@ -372,6 +419,32 @@ main() {
       continue
     fi
 
+    # Get state file info for checking
+    dest_resolved=$(resolve_destination "$dest")
+    safe_src=$(echo "$src" | sed 's/[^a-zA-Z0-9]/_/g')
+    safe_dest=$(echo "$dest_resolved" | sed 's/[^a-zA-Z0-9]/_/g')
+    state_file="${STATE_DIR}/${safe_src}_to_${safe_dest}.state"
+
+    # Check if source exists
+    if [ ! -d "$src" ] && [ ! -L "$src" ]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Source not found - $src" >>"$LOG_FILE"
+      continue
+    fi
+
+    # Check last sync time
+    last_sync=0
+    if [ -f "$state_file" ]; then
+      last_sync=$(cat "$state_file" 2>/dev/null)
+    fi
+
+    now=$(date +%s)
+
+    # Check if we should perform sync
+    if ! should_sync "$state_file" "$freq" "$now" "$last_sync"; then
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
     # Run synchronization
     if sync_folder "$src" "$dest" "$freq"; then
       sync_performed=$((sync_performed + 1))
@@ -381,12 +454,41 @@ main() {
 
   end_time=$(date '+%Y-%m-%d %H:%M:%S')
 
+  # Log sync summary
+  if [ "$FORCE_SYNC" -eq 1 ]; then
+    echo "[$end_time] Force sync completed: $sync_performed tasks executed" >>"$LOG_FILE"
+  elif [ "$sync_performed" -eq 0 ] && [ "$skipped_count" -gt 0 ]; then
+    # Remove boundary markers if all tasks were skipped
+    sed -i '' '$d' "$LOG_FILE" 2>/dev/null
+    return
+  fi
+
   # Only write end boundary if we wrote start boundary
   if [ "$sync_performed" -gt 0 ] || grep -q "SYNC CHECK START" "$LOG_FILE"; then
     echo "[$end_time] === SYNC CHECK END ===" >>"$LOG_FILE"
     echo "" >>"$LOG_FILE"
   fi
 }
+
+# Show usage
+show_usage() {
+  echo "Usage: $0 [OPTION]"
+  echo "Minimal folder synchronization script"
+  echo ""
+  echo "Options:"
+  echo "  -f, --force    Force sync all tasks regardless of frequency"
+  echo "  -h, --help     Show this help message"
+  echo ""
+  echo "Examples:"
+  echo "  $0             # Normal sync (respect frequency settings)"
+  echo "  $0 --force     # Force sync all tasks"
+  exit 0
+}
+
+# Parse help
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+  show_usage
+fi
 
 # Run main
 main

@@ -60,6 +60,9 @@
 
 ```bash
 ./sync.sh
+# 强制执行
+./sync.sh --force
+./sync.sh -f
 ```
 
 - 执行 `sync.conf` 中定义的所有同步任务

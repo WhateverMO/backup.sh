@@ -60,6 +60,9 @@ source_path:destination_path:frequency
 
 ```bash
 ./sync.sh
+# force execution
+./sync.sh --force
+./sync.sh -f
 ```
 
 - Runs all sync tasks defined in `sync.conf`
