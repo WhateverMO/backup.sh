@@ -45,13 +45,26 @@ get_file_size() {
   wc -c <"$file" 2>/dev/null || echo "0"
 }
 
-# Safe find function that only returns regular files
-find_regular_files() {
+# Get link target
+get_link_target() {
+  file="$1"
+  # Try readlink
+  if readlink "$file" 2>/dev/null; then
+    return
+  fi
+  # Try ls as fallback
+  ls -l "$file" 2>/dev/null | awk -F' -> ' '{print $2}' || echo ""
+}
+
+# Safe find function that returns regular files and symlinks
+find_files_and_links() {
   dir="$1"
-  # Use different find options for compatibility
-  find "$dir" -type f 2>/dev/null | grep -v "^$" | while IFS= read -r line; do
-    # Only process lines that look like file paths
-    if [ -f "$line" ]; then
+  # Find regular files (-type f) and symbolic links (-type l)
+  find "$dir" \( -type f -o -type l \) 2>/dev/null | while IFS= read -r line; do
+    # Skip empty lines
+    [ -z "$line" ] && continue
+    # Verify it's a file or symlink
+    if [ -f "$line" ] || [ -L "$line" ]; then
       echo "$line"
     fi
   done
@@ -72,6 +85,56 @@ resolve_destination() {
   esac
 }
 
+# Copy symlink preserving target
+copy_symlink() {
+  src="$1"
+  dest="$2"
+
+  # Get link target
+  target=$(get_link_target "$src")
+
+  if [ -z "$target" ]; then
+    return 1
+  fi
+
+  # Remove existing file/link
+  rm -f "$dest" 2>/dev/null
+
+  # Create symlink
+  ln -sf "$target" "$dest" 2>/dev/null
+  return $?
+}
+
+# Check if symlink needs update
+symlink_needs_update() {
+  src="$1"
+  dest="$2"
+
+  # If destination doesn't exist, needs update
+  if [ ! -L "$dest" ]; then
+    return 0
+  fi
+
+  # Get both link targets
+  src_target=$(get_link_target "$src")
+  dest_target=$(get_link_target "$dest")
+
+  # Compare targets
+  if [ "$src_target" != "$dest_target" ]; then
+    return 0
+  fi
+
+  # Compare modification times
+  src_mtime=$(get_file_mtime "$src")
+  dest_mtime=$(get_file_mtime "$dest")
+
+  if [ "$src_mtime" -gt "$dest_mtime" ] 2>/dev/null; then
+    return 0
+  fi
+
+  return 1
+}
+
 # Main synchronization function
 sync_folder() {
   src="$1"
@@ -89,14 +152,13 @@ sync_folder() {
   fi
 
   # Get state file path
-  # Use a sanitized name for the state file
   safe_src=$(echo "$src" | sed 's/[^a-zA-Z0-9]/_/g')
   safe_dest=$(echo "$dest" | sed 's/[^a-zA-Z0-9]/_/g')
   state_file="${STATE_DIR}/${safe_src}_to_${safe_dest}.state"
 
   # Check if source exists
-  if [ ! -d "$src" ]; then
-    log "ERROR: Source directory not found - $src"
+  if [ ! -d "$src" ] && [ ! -L "$src" ]; then
+    log "ERROR: Source not found - $src"
     return 1
   fi
 
@@ -150,66 +212,97 @@ sync_folder() {
 
   # Initialize counters
   new_files=0
+  new_links=0
   updated_files=0
+  updated_links=0
   same_files=0
-  total_files=0
+  same_links=0
+  total_items=0
 
-  # Store log entries temporarily to count files
-  temp_log=$(mktemp 2>/dev/null || echo /tmp/sync_temp_$$.log)
+  # Store log entries temporarily
+  temp_log=$(mktemp 2>/dev/null || echo "/tmp/sync_temp_$$.log")
 
-  # Process files
-  find_regular_files "$src" | while read -r src_file; do
+  # Process files and symlinks
+  find_files_and_links "$src" | while read -r src_item; do
     # Skip empty lines
-    [ -z "$src_file" ] && continue
+    [ -z "$src_item" ] && continue
 
-    rel_path="${src_file#$src}"
+    rel_path="${src_item#$src}"
     # Remove leading slash if present
     rel_path="${rel_path#/}"
-    dest_file="${dest}/${rel_path}"
+    dest_item="${dest}/${rel_path}"
 
     # Initialize counters
-    total_files=$((total_files + 1))
+    total_items=$((total_items + 1))
 
     # Create destination directory structure if needed
-    mkdir -p "$(dirname "$dest_file")" 2>/dev/null
+    mkdir -p "$(dirname "$dest_item")" 2>/dev/null
 
-    if [ ! -f "$dest_file" ]; then
-      # New file
-      if cp -p "$src_file" "$dest_file" 2>/dev/null; then
-        echo "  NEW: $rel_path" >>"$temp_log"
-        new_files=$((new_files + 1))
+    # Check if it's a symlink
+    if [ -L "$src_item" ]; then
+      # Handle symbolic link
+      if [ ! -L "$dest_item" ]; then
+        # New symlink
+        if copy_symlink "$src_item" "$dest_item"; then
+          echo "  NEW LINK: $rel_path -> $(get_link_target "$src_item")" >>"$temp_log"
+          new_links=$((new_links + 1))
+        else
+          echo "  FAILED LINK: $rel_path" >>"$temp_log"
+        fi
       else
-        echo "  FAILED: $rel_path" >>"$temp_log"
+        # Existing symlink, check if update needed
+        if symlink_needs_update "$src_item" "$dest_item"; then
+          if copy_symlink "$src_item" "$dest_item"; then
+            echo "  UPDATED LINK: $rel_path -> $(get_link_target "$src_item")" >>"$temp_log"
+            updated_links=$((updated_links + 1))
+          else
+            echo "  FAILED LINK: $rel_path" >>"$temp_log"
+          fi
+        else
+          # Link unchanged
+          same_links=$((same_links + 1))
+        fi
       fi
     else
-      # Compare files
-      src_mtime=$(get_file_mtime "$src_file")
-      dest_mtime=$(get_file_mtime "$dest_file")
-      src_size=$(get_file_size "$src_file")
-      dest_size=$(get_file_size "$dest_file")
-
-      # Check if files are different
-      should_update=0
-      if [ -z "$src_mtime" ] || [ -z "$dest_mtime" ]; then
-        # If we can't get mtime, use size
-        if [ "$src_size" -ne "$dest_size" ] 2>/dev/null; then
-          should_update=1
-        fi
-      elif [ "$src_mtime" -gt "$dest_mtime" ] 2>/dev/null || { [ "$src_size" != "$dest_size" ] 2>/dev/null; }; then
-        should_update=1
-      fi
-
-      if [ "$should_update" -eq 1 ]; then
-        # File changed
-        if cp -p "$src_file" "$dest_file" 2>/dev/null; then
-          echo "  UPDATED: $rel_path" >>"$temp_log"
-          updated_files=$((updated_files + 1))
+      # Handle regular file
+      if [ ! -f "$dest_item" ]; then
+        # New file
+        if cp -p "$src_item" "$dest_item" 2>/dev/null; then
+          echo "  NEW: $rel_path" >>"$temp_log"
+          new_files=$((new_files + 1))
         else
           echo "  FAILED: $rel_path" >>"$temp_log"
         fi
       else
-        # File unchanged
-        same_files=$((same_files + 1))
+        # Compare files
+        src_mtime=$(get_file_mtime "$src_item")
+        dest_mtime=$(get_file_mtime "$dest_item")
+        src_size=$(get_file_size "$src_item")
+        dest_size=$(get_file_size "$dest_item")
+
+        # Check if files are different
+        should_update=0
+        if [ -z "$src_mtime" ] || [ -z "$dest_mtime" ]; then
+          # If we can't get mtime, use size
+          if [ "$src_size" -ne "$dest_size" ] 2>/dev/null; then
+            should_update=1
+          fi
+        elif [ "$src_mtime" -gt "$dest_mtime" ] 2>/dev/null || { [ "$src_size" != "$dest_size" ] 2>/dev/null; }; then
+          should_update=1
+        fi
+
+        if [ "$should_update" -eq 1 ]; then
+          # File changed
+          if cp -p "$src_item" "$dest_item" 2>/dev/null; then
+            echo "  UPDATED: $rel_path" >>"$temp_log"
+            updated_files=$((updated_files + 1))
+          else
+            echo "  FAILED: $rel_path" >>"$temp_log"
+          fi
+        else
+          # File unchanged
+          same_files=$((same_files + 1))
+        fi
       fi
     fi
   done
@@ -217,21 +310,26 @@ sync_folder() {
   # Update state file
   echo "$now" >"$state_file" 2>/dev/null
 
+  # Calculate totals
+  total_new=$((new_files + new_links))
+  total_updated=$((updated_files + updated_links))
+  total_same=$((same_files + same_links))
+
   # Write detailed log if there were changes
   if [ -f "$temp_log" ]; then
-    if [ "$new_files" -gt 0 ] || [ "$updated_files" -gt 0 ]; then
+    if [ "$total_new" -gt 0 ] || [ "$total_updated" -gt 0 ]; then
       cat "$temp_log" >>"$LOG_FILE"
-      log "SUMMARY: total=$total_files, new=$new_files, updated=$updated_files, same=$same_files"
+      log "SUMMARY: total=$total_items, new=$total_new (files:$new_files,links:$new_links), updated=$total_updated (files:$updated_files,links:$updated_links), same=$total_same"
     fi
     rm -f "$temp_log"
   fi
 
   # Log single line if no changes
-  if [ "$total_files" -gt 0 ] && [ "$new_files" -eq 0 ] && [ "$updated_files" -eq 0 ]; then
+  if [ "$total_items" -gt 0 ] && [ "$total_new" -eq 0 ] && [ "$total_updated" -eq 0 ]; then
     # Remove the SYNC line
     sed -i '' '$d' "$LOG_FILE" 2>/dev/null
     # Write NO CHANGE line
-    log "NO CHANGE: $src -> $dest ($total_files files)"
+    log "NO CHANGE: $src -> $dest ($total_items items)"
   fi
 }
 
