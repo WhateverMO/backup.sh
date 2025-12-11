@@ -1,4 +1,3 @@
-sync.conf.tmplt
 data/*
 .sync_state/*
 *.log
