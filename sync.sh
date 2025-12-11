@@ -28,7 +28,7 @@ get_file_mtime() {
     return
   fi
   # Try ls as fallback
-  ls -l "$file" | awk '{print $6, $7, $8}' | date -jf "%b %d %H:%M" +%s 2>/dev/null || echo "0"
+  ls -l "$file" 2>/dev/null | awk '{print $6, $7, $8}' | date -jf "%b %d %H:%M" +%s 2>/dev/null || echo "0"
 }
 
 get_file_size() {
@@ -43,6 +43,18 @@ get_file_size() {
   fi
   # Try wc as fallback
   wc -c <"$file" 2>/dev/null || echo "0"
+}
+
+# Safe find function that only returns regular files
+find_regular_files() {
+  dir="$1"
+  # Use different find options for compatibility
+  find "$dir" -type f 2>/dev/null | grep -v "^$" | while IFS= read -r line; do
+    # Only process lines that look like file paths
+    if [ -f "$line" ]; then
+      echo "$line"
+    fi
+  done
 }
 
 # Resolve destination path
@@ -79,7 +91,8 @@ sync_folder() {
   # Get state file path
   # Use a sanitized name for the state file
   safe_src=$(echo "$src" | sed 's/[^a-zA-Z0-9]/_/g')
-  state_file="${STATE_DIR}/${safe_src}_to_$(echo "$dest" | sed 's/[^a-zA-Z0-9]/_/g').state"
+  safe_dest=$(echo "$dest" | sed 's/[^a-zA-Z0-9]/_/g')
+  state_file="${STATE_DIR}/${safe_src}_to_${safe_dest}.state"
 
   # Check if source exists
   if [ ! -d "$src" ]; then
@@ -132,6 +145,7 @@ sync_folder() {
   fi
 
   # Start synchronization
+  sync_start_time=$(date '+%Y-%m-%d %H:%M:%S')
   log "SYNC: $src -> $dest"
 
   # Initialize counters
@@ -140,8 +154,14 @@ sync_folder() {
   same_files=0
   total_files=0
 
+  # Store log entries temporarily to count files
+  temp_log=$(mktemp 2>/dev/null || echo /tmp/sync_temp_$$.log)
+
   # Process files
-  find "$src" -type f 2>/dev/null | while read -r src_file; do
+  find_regular_files "$src" | while read -r src_file; do
+    # Skip empty lines
+    [ -z "$src_file" ] && continue
+
     rel_path="${src_file#$src}"
     # Remove leading slash if present
     rel_path="${rel_path#/}"
@@ -155,12 +175,11 @@ sync_folder() {
 
     if [ ! -f "$dest_file" ]; then
       # New file
-      cp -p "$src_file" "$dest_file" 2>/dev/null
-      if [ $? -eq 0 ]; then
-        log "  NEW: $rel_path"
+      if cp -p "$src_file" "$dest_file" 2>/dev/null; then
+        echo "  NEW: $rel_path" >>"$temp_log"
         new_files=$((new_files + 1))
       else
-        log "  FAILED: $rel_path"
+        echo "  FAILED: $rel_path" >>"$temp_log"
       fi
     else
       # Compare files
@@ -170,27 +189,23 @@ sync_folder() {
       dest_size=$(get_file_size "$dest_file")
 
       # Check if files are different
+      should_update=0
       if [ -z "$src_mtime" ] || [ -z "$dest_mtime" ]; then
         # If we can't get mtime, use size
-        if [ "$src_size" -ne "$dest_size" ]; then
+        if [ "$src_size" -ne "$dest_size" ] 2>/dev/null; then
           should_update=1
-        else
-          should_update=0
         fi
-      elif [ "$src_mtime" -gt "$dest_mtime" ] || [ "$src_size" -ne "$dest_size" ]; then
+      elif [ "$src_mtime" -gt "$dest_mtime" ] 2>/dev/null || { [ "$src_size" != "$dest_size" ] 2>/dev/null; }; then
         should_update=1
-      else
-        should_update=0
       fi
 
       if [ "$should_update" -eq 1 ]; then
         # File changed
-        cp -p "$src_file" "$dest_file" 2>/dev/null
-        if [ $? -eq 0 ]; then
-          log "  UPDATED: $rel_path"
+        if cp -p "$src_file" "$dest_file" 2>/dev/null; then
+          echo "  UPDATED: $rel_path" >>"$temp_log"
           updated_files=$((updated_files + 1))
         else
-          log "  FAILED: $rel_path"
+          echo "  FAILED: $rel_path" >>"$temp_log"
         fi
       else
         # File unchanged
@@ -202,15 +217,21 @@ sync_folder() {
   # Update state file
   echo "$now" >"$state_file" 2>/dev/null
 
-  # Log summary
-  if [ "$total_files" -eq 0 ]; then
-    log "NO CHANGE: $src -> $dest (0 files)"
-  elif [ "$new_files" -eq 0 ] && [ "$updated_files" -eq 0 ]; then
-    # Remove the SYNC and SUMMARY lines and replace with NO CHANGE
-    # We'll handle this differently
+  # Write detailed log if there were changes
+  if [ -f "$temp_log" ]; then
+    if [ "$new_files" -gt 0 ] || [ "$updated_files" -gt 0 ]; then
+      cat "$temp_log" >>"$LOG_FILE"
+      log "SUMMARY: total=$total_files, new=$new_files, updated=$updated_files, same=$same_files"
+    fi
+    rm -f "$temp_log"
+  fi
+
+  # Log single line if no changes
+  if [ "$total_files" -gt 0 ] && [ "$new_files" -eq 0 ] && [ "$updated_files" -eq 0 ]; then
+    # Remove the SYNC line
+    sed -i '' '$d' "$LOG_FILE" 2>/dev/null
+    # Write NO CHANGE line
     log "NO CHANGE: $src -> $dest ($total_files files)"
-  else
-    log "SUMMARY: total=$total_files, new=$new_files, updated=$updated_files, same=$same_files"
   fi
 }
 
@@ -218,35 +239,38 @@ sync_folder() {
 main() {
   # Write boundary marker
   start_time=$(date '+%Y-%m-%d %H:%M:%S')
-  log "=== SYNC CHECK START at $start_time ==="
+  echo "[$start_time] === SYNC CHECK START ===" >>"$LOG_FILE"
 
   # Check if config file exists
   if [ ! -f "$CONFIG_FILE" ]; then
-    log "ERROR: Configuration file not found - $CONFIG_FILE"
+    echo "[$start_time] ERROR: Configuration file not found - $CONFIG_FILE" >>"$LOG_FILE"
     exit 1
   fi
 
   # Track if any sync was actually performed
   sync_performed=0
+  line_number=0
 
   # Process each line in config file
   while IFS= read -r line; do
+    line_number=$((line_number + 1))
+
     # Remove comments and trim
-    line=$(echo "$line" | sed 's/#.*$//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+    clean_line=$(echo "$line" | sed 's/#.*$//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
 
     # Skip empty lines
-    if [ -z "$line" ]; then
+    if [ -z "$clean_line" ]; then
       continue
     fi
 
     # Parse source:destination:frequency
-    src=$(echo "$line" | cut -d: -f1)
-    dest=$(echo "$line" | cut -d: -f2)
-    freq=$(echo "$line" | cut -d: -f3)
+    src=$(echo "$clean_line" | cut -d: -f1)
+    dest=$(echo "$clean_line" | cut -d: -f2)
+    freq=$(echo "$clean_line" | cut -d: -f3)
 
     # Validate
     if [ -z "$src" ] || [ -z "$dest" ] || [ -z "$freq" ]; then
-      log "ERROR: Invalid configuration line: $line"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Invalid configuration at line $line_number: $line" >>"$LOG_FILE"
       continue
     fi
 
@@ -259,20 +283,10 @@ main() {
 
   end_time=$(date '+%Y-%m-%d %H:%M:%S')
 
-  # If no sync was performed, remove the boundary markers
-  if [ "$sync_performed" -eq 0 ]; then
-    # Get line count
-    line_count=$(wc -l <"$LOG_FILE" 2>/dev/null || echo 0)
-
-    # Remove the last 2 lines (boundary markers)
-    if [ "$line_count" -gt 2 ]; then
-      # Save all lines except the boundary markers
-      head -n -2 "$LOG_FILE" >"${LOG_FILE}.tmp" 2>/dev/null
-      mv "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null
-    fi
-  else
-    # Write end boundary
-    log "=== SYNC CHECK END at $end_time ===\n"
+  # Only write end boundary if we wrote start boundary
+  if [ "$sync_performed" -gt 0 ] || grep -q "SYNC CHECK START" "$LOG_FILE"; then
+    echo "[$end_time] === SYNC CHECK END ===" >>"$LOG_FILE"
+    echo "" >>"$LOG_FILE"
   fi
 }
 
